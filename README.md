@@ -1,5 +1,8 @@
 # Vosk TTS
 
+!!! Тут добавлена лишь одна функция: synth_bytes, которая возвращает не wav, а байтовый поток.
+стрим не доступный
+
 Simple TTS based on VITS with some old ideas
 
 ## Usage
