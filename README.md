@@ -8,7 +8,7 @@ Simple TTS based on VITS with some old ideas
 ## Usage
 
 ### ToBytes
-      
+```
 from vosk_tts import Model, Synth
 
 model = Model(model_name="vosk-model-tts-ru-0.8-multi")
@@ -20,7 +20,7 @@ with open("output_from_bytes.wav", "wb") as f:
     print(f)
     #
     f.write(wav_bytes)
-      
+```
 
 ### Command line
 
