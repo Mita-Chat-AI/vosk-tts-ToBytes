@@ -5,6 +5,7 @@ import wave
 import time
 import re
 import logging
+import io
 
 from .g2p import convert
 
@@ -114,10 +115,6 @@ class Synth:
             f.setsampwidth(2)
             f.setframerate(22050)
             f.writeframes(audio.tobytes())
-
-
-
-    import io
 
     def synth_bytes(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
         """Синтезирует речь и возвращает результат в виде байтового WAV-потока"""
