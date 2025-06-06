@@ -114,7 +114,9 @@ class Synth:
             f.setsampwidth(2)
             f.setframerate(22050)
             f.writeframes(audio.tobytes())
-    
+
+
+
     import io
 
     def synth_bytes(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
@@ -129,8 +131,7 @@ class Synth:
             f.writeframes(audio.tobytes())
         buffer.seek(0)
         return buffer.read()
-
-    
+        
     def g2p(self, text, embeddings):
         pattern = "([,.?!;:\"() ])"
         phonemes = ["^"]
