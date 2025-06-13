@@ -6,8 +6,58 @@ import time
 import re
 import logging
 import io
+import wave
+sess_options = onnxruntime.SessionOptions()
+sess_options.enable_cpu_mem_arena = False
+sess_options.enable_mem_pattern = False
+sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 
+import io
+import wave
+import numpy as np
 from .g2p import convert
+
+import re
+
+def flexible_text_split(text, max_chunk_len=100):
+    """
+    Гибко разбивает текст на фрагменты:
+    1) Сначала на предложения по знакам [.?!]
+    2) Если предложение длиннее max_chunk_len, режет его по словам на более мелкие части
+    """
+
+    # 1) Разбиваем на предложения с сохранением знаков
+    pattern = r'([^.!?]*[.!?]+)'
+    sentences = re.findall(pattern, text, flags=re.DOTALL)
+
+    # Остаток после предложений
+    remainder = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    if remainder:
+        sentences.append(remainder)
+
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    # 2) Разбиваем длинные предложения на подфрагменты
+    chunks = []
+    for sentence in sentences:
+        if len(sentence) <= max_chunk_len:
+            chunks.append(sentence)
+        else:
+            # Разбиваем по пробелам
+            words = sentence.split()
+            current_chunk = ""
+            for word in words:
+                # Если добавление слова превышает лимит, сохраняем текущий и начинаем новый
+                if len(current_chunk) + len(word) + 1 > max_chunk_len:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = word
+                else:
+                    current_chunk += " " + word
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+
+    return chunks
+
 
 class Synth:
 
@@ -81,10 +131,9 @@ class Synth:
                 "input": text,
                 "input_lengths": text_lengths,
                 "scales": scales,
-                "sid": sid,
+                "sid": sid,  # ✅ ОСТАВИТЬ!
         }
-        if self.model.tokenizer != None:
-            args["bert"] = bert_embs
+
 
         start_time = time.perf_counter()
         audio = self.model.onnx.run(
@@ -105,16 +154,43 @@ class Synth:
 
         logging.info("Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)" % (real_time_factor, infer_sec, audio_duration_sec))
         return audio
+    
+
+    def safe_synth_audio(self, text, *args, **kwargs):
+        """
+        Разбивает длинный текст на предложения и синтезирует каждое отдельно, 
+        чтобы не перегружать VRAM. Затем объединяет аудио.
+        """
+        # Разбиваем на предложения по знакам препинания
+        segments = re.split(r'(?<=[.!?])\s+', text.strip())
+
+        audio_chunks = []
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                continue
+            try:
+                audio = self.synth_audio(segment, *args, **kwargs)
+                audio_chunks.append(audio)
+            except Exception as e:
+                logging.warning(f"Ошибка при синтезе сегмента '{segment}': {e}")
+
+        if not audio_chunks:
+            raise RuntimeError("Не удалось сгенерировать аудио ни для одного сегмента.")
+
+        return np.concatenate(audio_chunks)
+
 
     def synth(self, text, oname, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
 
-        audio = self.synth_audio(text, speaker_id, noise_level, speech_rate, duration_noise_level, scale)
+        audio = self.safe_synth_audio(text, speaker_id, noise_level, speech_rate, duration_noise_level, scale)
 
         with wave.open(oname, "w") as f:
             f.setnchannels(1)
             f.setsampwidth(2)
             f.setframerate(22050)
             f.writeframes(audio.tobytes())
+
 
     def synth_bytes(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
         """Синтезирует речь и возвращает результат в виде байтового WAV-потока"""
@@ -128,7 +204,80 @@ class Synth:
             f.writeframes(audio.tobytes())
         buffer.seek(0)
         return buffer.read()
-        
+    
+
+
+ 
+
+
+    
+
+    def synth_streaming_bytes(synth_obj, text, chunk_size=50, **kwargs) -> bytes:
+        """
+        Синтезирует речь кусками по chunk_size символов,
+        возвращает весь результат в виде WAV-байтов.
+        """
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+        audio_chunks = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                audio_bytes = synth_obj.synth_bytes(chunk, **kwargs)  # возвращает WAV bytes для куска
+                # Нужно из WAV bytes вырезать заголовок и взять только raw audio data
+                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    audio_chunks.append(frames)
+            except Exception as e:
+                print(f"Ошибка при синтезе фрагмента '{chunk}': {e}")
+
+        if not audio_chunks:
+            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
+
+        # Объединяем аудио фреймы
+        combined_frames = b"".join(audio_chunks)
+
+        # Создаем итоговый WAV в памяти с правильным заголовком
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit audio = 2 bytes per sample
+            wf.setframerate(22050)
+            wf.writeframes(combined_frames)
+
+        return buffer.getvalue()
+
+
+    def synth_streaming_flexible(synth_obj, text, max_chunk_len=100, **kwargs) -> bytes:
+        chunks = flexible_text_split(text, max_chunk_len=max_chunk_len)
+        audio_chunks = []
+
+        for chunk in chunks:
+            try:
+                audio_bytes = synth_obj.synth_bytes(chunk, **kwargs)
+                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    audio_chunks.append(frames)
+            except Exception as e:
+                print(f"Ошибка при синтезе '{chunk}': {e}")
+
+        if not audio_chunks:
+            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
+
+        combined_frames = b"".join(audio_chunks)
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(22050)
+            wf.writeframes(combined_frames)
+
+        return buffer.getvalue()
+
+
+
     def g2p(self, text, embeddings):
         pattern = "([,.?!;:\"() ])"
         phonemes = ["^"]
