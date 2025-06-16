@@ -17,6 +17,10 @@ import wave
 import numpy as np
 from .g2p import convert
 
+from deepmultilingualpunctuation import PunctuationModel
+
+punct_model = PunctuationModel()
+
 import re
 
 def flexible_text_split(text, max_chunk_len=100):
@@ -93,6 +97,8 @@ class Synth:
         return bert
 
     def synth_audio(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
+        print(f"TOKENIZER: {self.model.tokenizer}")
+
 
         if noise_level is None:
             noise_level = self.model.config["inference"].get("noise_level", 0.8)
@@ -276,14 +282,21 @@ class Synth:
 
         return buffer.getvalue()
 
+    def punctuate_text(self, text: str) -> str:
+        keep_only_russian = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?;:\-—()]', '', text)
 
+        text = re.sub(r'[,.!?;:…]', '', keep_only_russian)  # удаляем старую пунктуацию
+
+        return punct_model.restore_punctuation(text)
 
     def g2p(self, text, embeddings):
+        punctuate_text = self.punctuate_text(text)
+        print(punctuate_text)
         pattern = "([,.?!;:\"() ])"
         phonemes = ["^"]
         phone_embeddings = [embeddings[0]]
         word_index = 1
-        for word in re.split(pattern, text.lower()):
+        for word in re.split(pattern, punctuate_text.lower()):
             if word == "":
                 continue
             if re.match(pattern, word) or word == '-':
@@ -350,9 +363,11 @@ class Synth:
 
 
     def g2p_noembed(self, text):
+        punctuate_text = self.punctuate_text(text)
+        print(punctuate_text)
         pattern = "([,.?!;:\"() ])"
         phonemes = ["^"]
-        for word in re.split(pattern, text.lower()):
+        for word in re.split(pattern, punctuate_text.lower()):
             if word == "":
                 continue
             if re.match(pattern, word) or word == '-':
