@@ -1,345 +1,184 @@
 import json
-import numpy as np
-import onnxruntime
-import wave
 import time
-import re
 import logging
+import re
 import io
-import wave
-sess_options = onnxruntime.SessionOptions()
-sess_options.enable_cpu_mem_arena = False
-sess_options.enable_mem_pattern = False
-sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-
-import io
-import wave
 import numpy as np
+import wave
+from pydub import AudioSegment
 from .g2p import convert
-
 from deepmultilingualpunctuation import PunctuationModel
 
-punct_model = PunctuationModel()
-
-import re
-
-# def flexible_text_split(text, max_chunk_len=100):
-#     """
-#     Гибко разбивает текст на фрагменты:
-#     1) Сначала на предложения по знакам [.?!]
-#     2) Если предложение длиннее max_chunk_len, режет его по словам на более мелкие части
-#     """
-
-#     # 1) Разбиваем на предложения с сохранением знаков
-#     pattern = r'([^.!?]*[.!?]+)'
-#     sentences = re.findall(pattern, text, flags=re.DOTALL)
-
-#     # Остаток после предложений
-#     remainder = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-#     if remainder:
-#         sentences.append(remainder)
-
-#     sentences = [s.strip() for s in sentences if s.strip()]
-
-#     # 2) Разбиваем длинные предложения на подфрагменты
-#     chunks = []
-#     for sentence in sentences:
-#         if len(sentence) <= max_chunk_len:
-#             chunks.append(sentence)
-#         else:
-#             # Разбиваем по пробелам
-#             words = sentence.split()
-#             current_chunk = ""
-#             for word in words:
-#                 # Если добавление слова превышает лимит, сохраняем текущий и начинаем новый
-#                 if len(current_chunk) + len(word) + 1 > max_chunk_len:
-#                     chunks.append(current_chunk.strip())
-#                     current_chunk = word
-#                 else:
-#                     current_chunk += " " + word
-#             if current_chunk:
-#                 chunks.append(current_chunk.strip())
-
-#     return chunks
-
-
-from pydub import AudioSegment
-import numpy as np
 
 def load_breath(path='breath.wav') -> np.ndarray:
     audio = AudioSegment.from_file(path)
-    audio = audio.set_channels(1).set_frame_rate(22050).set_sample_width(2)  # 16-bit PCM
-    samples = np.array(audio.get_array_of_samples(), dtype=np.int16)
-    return samples
+    audio = audio.set_channels(1).set_frame_rate(22050).set_sample_width(2)
+    return np.array(audio.get_array_of_samples(), dtype=np.int16)
+
 
 def flexible_text_split(text):
     pattern = r'(.*?[.,!?])'
     sentences = re.findall(pattern, text, flags=re.DOTALL)
-
-    leftover = re.sub(''.join(sentences), '', text, count=1).strip() if sentences else text.strip()
-
-    result = [s.strip() for s in sentences if s.strip()]
-    if leftover:
-        result.append(leftover)
-
-    print(result)
-
-    return result
+    leftover = text[len(''.join(sentences)):].strip()
+    return [s.strip() for s in sentences if s.strip()] + ([leftover] if leftover else [])
 
 
 class Synth:
-
     def __init__(self, model):
         self.model = model
+        self.punct_model = PunctuationModel()
 
-    def audio_float_to_int16(self,
-        audio: np.ndarray, max_wav_value: float = 32767.0
-    ) -> np.ndarray:
-        """Normalize audio and convert to int16 range"""
-        audio_norm = audio * max_wav_value
-        audio_norm = np.clip(audio_norm, -max_wav_value, max_wav_value)
-        audio_norm = audio_norm.astype("int16")
-        return audio_norm
+    def audio_float_to_int16(self, audio: np.ndarray, max_wav_value: float = 32767.0) -> np.ndarray:
+        audio = np.clip(audio * max_wav_value, -max_wav_value, max_wav_value)
+        return audio.astype("int16")
 
     def get_word_bert(self, text):
         tokens = self.model.tokenizer.encode(text.replace("+", ""))
         bert = self.model.bert_onnx.run(
             None,
             {
-               "input_ids": [tokens.ids],
-               "attention_mask": [tokens.attention_mask],
-               "token_type_ids": [tokens.type_ids],
+                "input_ids": [tokens.ids],
+                "attention_mask": [tokens.attention_mask],
+                "token_type_ids": [tokens.type_ids],
             }
         )[0]
-
-        # Select only first token in multitoken words
-        selected = [0]
-        for i, t in enumerate(tokens.tokens):
-            if t[0] != '#':
-                selected.append(i)
-        bert = bert[selected]
-        return bert
+        selected = [i for i, t in enumerate(tokens.tokens) if not t.startswith('#')]
+        return bert[[0] + selected]
 
     def synth_audio(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
-        print(f"TOKENIZER: {self.model.tokenizer}")
+        noise_level = noise_level if noise_level is not None else self.model.config["inference"].get("noise_level", 0.8)
+        speech_rate = speech_rate if speech_rate is not None else self.model.config["inference"].get("speech_rate", 1.0)
+        duration_noise_level = duration_noise_level if duration_noise_level is not None else self.model.config["inference"].get("duration_noise_level", 0.8)
+        scale = scale if scale is not None else self.model.config["inference"].get("scale", 1.0)
 
+        text = text.replace("—", "-")
 
-        if noise_level is None:
-            noise_level = self.model.config["inference"].get("noise_level", 0.8)
-        if speech_rate is None:
-            speech_rate = self.model.config["inference"].get("speech_rate", 1.0)
-        if duration_noise_level is None:
-            duration_noise_level = self.model.config["inference"].get("duration_noise_level", 0.8)
-        if scale is None:
-            scale = self.model.config["inference"].get("scale", 1.0)
-
-        text = re.sub("—", "-", text)
-
-        if self.model.tokenizer != None and self.model.config.get("no_blank", 0) == 0:
+        if self.model.tokenizer:
             bert = self.get_word_bert(text)
-            phoneme_ids, bert_embs = self.g2p(text, bert)
-            bert_embs = np.expand_dims(np.transpose(np.array(bert_embs, dtype=np.float32)), 0)
-        elif self.model.tokenizer != None and self.model.config.get("no_blank", 0) != 0:
-            bert = self.get_word_bert(text)
-            phoneme_ids, bert_embs = self.g2p_noblank(text, bert)
+            if self.model.config.get("no_blank", 0):
+                phoneme_ids, bert_embs = self.g2p_noblank(text, bert)
+            else:
+                phoneme_ids, bert_embs = self.g2p(text, bert)
             bert_embs = np.expand_dims(np.transpose(np.array(bert_embs, dtype=np.float32)), 0)
         else:
             phoneme_ids = self.g2p_noembed(text)
             bert_embs = np.zeros((1, 768, len(phoneme_ids)), dtype=np.float32)
 
-        # Run main prediction
-        text = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
-        text_lengths = np.array([text.shape[1]], dtype=np.int64)
-        scales = np.array([noise_level, 1.0 / speech_rate, duration_noise_level], dtype=np.float32)
-
-        # Assign first voice
-        if speaker_id is None:
-            speaker_id = 0
-        sid = np.array([speaker_id], dtype=np.int64)
-
+        input_tensor = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
         args = {
-                "input": text,
-                "input_lengths": text_lengths,
-                "scales": scales,
-                "sid": sid,  # ✅ ОСТАВИТЬ!
+            "input": input_tensor,
+            "input_lengths": np.array([input_tensor.shape[1]], dtype=np.int64),
+            "scales": np.array([noise_level, 1.0 / speech_rate, duration_noise_level], dtype=np.float32),
+            "sid": np.array([speaker_id or 0], dtype=np.int64),
         }
 
-
-        start_time = time.perf_counter()
-        audio = self.model.onnx.run(
-            None,
-            args
-        )[0]
-        audio = audio.squeeze()
-        audio = audio * scale
-
+        start = time.perf_counter()
+        audio = self.model.onnx.run(None, args)[0].squeeze() * scale
         audio = self.audio_float_to_int16(audio)
-        end_time = time.perf_counter()
+        duration = time.perf_counter() - start
+        rtf = duration / (len(audio) / 22050) if audio.size > 0 else 0
 
-        audio_duration_sec = audio.shape[-1] / 22050
-        infer_sec = end_time - start_time
-        real_time_factor = (
-            infer_sec / audio_duration_sec if audio_duration_sec > 0 else 0.0
-        )
-
-        logging.info("Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)" % (real_time_factor, infer_sec, audio_duration_sec))
+        logging.info(f"RTF: {rtf:.2f} (infer={duration:.2f}s, audio={len(audio)/22050:.2f}s)")
         return audio
 
-
-    
-    def fast_synth_streaming_bytes(synth_obj, text, pause_duration=0.4, breath_path='breath.wav', **kwargs) -> bytes:
+    def fast_synth_streaming_bytes(self, text, pause_duration=0.4, breath_path='breath.wav', **kwargs) -> bytes:
         chunks = flexible_text_split(text)
         breath_audio = load_breath(breath_path)
         audio_chunks = []
 
         for i, chunk in enumerate(chunks):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
             try:
-                audio = synth_obj.synth_audio(chunk, **kwargs)
+                audio = self.synth_audio(chunk, **kwargs)
                 audio_chunks.append(audio)
-                # Добавляем дыхание между кусками, кроме последнего
                 if i < len(chunks) - 1:
                     audio_chunks.append(breath_audio)
             except Exception as e:
-                print(f"Ошибка при синтезе '{chunk}': {e}")
+                logging.error(f"Ошибка синтеза '{chunk}': {e}")
 
         if not audio_chunks:
-            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
+            raise RuntimeError("Ни один фрагмент не был синтезирован.")
 
         final_audio = np.concatenate(audio_chunks)
-
-        buffer = io.BytesIO()
-        with wave.open(buffer, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(22050)
-            wf.writeframes(final_audio.tobytes())
-
-        return buffer.getvalue()
-
-
-
-
-
+        with io.BytesIO() as buffer:
+            with wave.open(buffer, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(22050)
+                wf.writeframes(final_audio.tobytes())
+            return buffer.getvalue()
 
     def punctuate_text(self, text: str) -> str:
-        keep_only_russian = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?;:\-—()]', '', text)
-
-        text = re.sub(r'[,.!?;:…]', '', keep_only_russian)  # удаляем старую пунктуацию
-
-        print(text)
-        result = punct_model.restore_punctuation(text)
-        print(result)
-
-        return result
+        clean_text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?;:\-—()]', '', text)
+        no_punct = re.sub(r'[,.!?;:…]', '', clean_text)
+        return self.punct_model.restore_punctuation(no_punct)
 
     def g2p(self, text, embeddings):
-        punctuate_text = self.punctuate_text(text)
-        print(punctuate_text)
-        pattern = "([,.?!;:\"() ])"
+        punctuated = self.punctuate_text(text)
+        pattern = r"([,.?!;:\"() ])"
         phonemes = ["^"]
         phone_embeddings = [embeddings[0]]
         word_index = 1
-        for word in re.split(pattern, punctuate_text.lower()):
-            if word == "":
+
+        for word in re.split(pattern, punctuated.lower()):
+            if not word:
                 continue
             if re.match(pattern, word) or word == '-':
                 phonemes.append(word)
-                phone_embeddings.append(embeddings[word_index])
-            elif word in self.model.dic:
-                for p in self.model.dic[word].split():
-                    phonemes.append(p)
-                    phone_embeddings.append(embeddings[word_index])
             else:
-                for p in convert(word).split():
-                    phonemes.append(p)
-                    phone_embeddings.append(embeddings[word_index])
+                phonemes.extend(self.model.dic.get(word, convert(word)).split())
+            phone_embeddings.extend([embeddings[word_index]] * len(phonemes[-1]))
             if word != " ":
-                word_index = word_index + 1
+                word_index += 1
+
         phonemes.append("$")
         phone_embeddings.append(embeddings[-1])
 
-        # Convert to ids and intersperse with blank
-        phoneme_id_map = self.model.config["phoneme_id_map"]
-        phoneme_ids = [phoneme_id_map[phonemes[0]]]
-        phone_embeddings_is = [phone_embeddings[0]]
+        ids = [self.model.config["phoneme_id_map"][phonemes[0]]]
+        emb = [phone_embeddings[0]]
         for i in range(1, len(phonemes)):
-            phoneme_ids.append(0)
-            phoneme_ids.append(phoneme_id_map[phonemes[i]])
-            phone_embeddings_is.append(phone_embeddings[i])
-            phone_embeddings_is.append(phone_embeddings[i])
+            ids.extend([0, self.model.config["phoneme_id_map"][phonemes[i]]])
+            emb.extend([phone_embeddings[i]] * 2)
 
-        logging.info(f"Text: {text}")
         logging.info(f"Phonemes: {phonemes}")
-        return phoneme_ids, phone_embeddings_is
+        return ids, emb
 
     def g2p_noblank(self, text, embeddings):
-        pattern = "([,.?!;:\"() ])"
+        pattern = r"([,.?!;:\"() ])"
         phonemes = ["^"]
         phone_embeddings = [embeddings[0]]
         word_index = 1
+
         for word in re.split(pattern, text.lower()):
-            if word == "":
+            if not word:
                 continue
-            if re.match(pattern, word) or word == '-':
-                phonemes.append(word)
-                phone_embeddings.append(embeddings[word_index])
-            elif word in self.model.dic:
-                for p in self.model.dic[word].split():
-                    phonemes.append(p)
-                    phone_embeddings.append(embeddings[word_index])
-            else:
-                for p in convert(word).split():
-                    phonemes.append(p)
-                    phone_embeddings.append(embeddings[word_index])
+            phonemes.extend(self.model.dic.get(word, convert(word)).split())
+            phone_embeddings.extend([embeddings[word_index]] * len(phonemes[-1]))
             if word != " ":
-                word_index = word_index + 1
+                word_index += 1
+
         phonemes.append("$")
         phone_embeddings.append(embeddings[-1])
 
-        # Convert to ids and intersperse with blank
-        phoneme_id_map = self.model.config["phoneme_id_map"]
-        phoneme_ids = [phoneme_id_map[p] for p in phonemes]
-
-        logging.info(f"Text: {text}")
-        logging.info(f"Phonemes: {phonemes}")
-        return phoneme_ids, phone_embeddings
-
+        ids = [self.model.config["phoneme_id_map"][p] for p in phonemes]
+        return ids, phone_embeddings
 
     def g2p_noembed(self, text):
-        punctuate_text = self.punctuate_text(text)
-        print(punctuate_text)
-        pattern = "([,.?!;:\"() ])"
+        punctuated = self.punctuate_text(text)
+        pattern = r"([,.?!;:\"() ])"
         phonemes = ["^"]
-        for word in re.split(pattern, punctuate_text.lower()):
-            if word == "":
+
+        for word in re.split(pattern, punctuated.lower()):
+            if not word:
                 continue
-            if re.match(pattern, word) or word == '-':
-                phonemes.append(word)
-            elif word in self.model.dic:
-                for p in self.model.dic[word].split():
-                    phonemes.append(p)
-            else:
-                for p in convert(word).split():
-                    phonemes.append(p)
+            phonemes.extend(self.model.dic.get(word, convert(word)).split())
+
         phonemes.append("$")
+        ids = []
+        map_ = self.model.config["phoneme_id_map"]
+        ids.extend(map_[phonemes[0]] if isinstance(map_[phonemes[0]], list) else [map_[phonemes[0]]])
+        for i in range(1, len(phonemes)):
+            ids.append(0)
+            next_ids = map_[phonemes[i]]
+            ids.extend(next_ids if isinstance(next_ids, list) else [next_ids])
 
-        # Convert to ids and intersperse with blank
-        phoneme_id_map = self.model.config["phoneme_id_map"]
-        if isinstance(phoneme_id_map[phonemes[0]], list):
-            phoneme_ids = []
-            phoneme_ids.extend(phoneme_id_map[phonemes[0]])
-            for i in range(1, len(phonemes)):
-                phoneme_ids.append(0)
-                phoneme_ids.extend(phoneme_id_map[phonemes[i]])
-        else:
-            phoneme_ids = [phoneme_id_map[phonemes[0]]]
-            for i in range(1, len(phonemes)):
-                phoneme_ids.append(0)
-                phoneme_ids.append(phoneme_id_map[phonemes[i]])
-
-        logging.info(f"Text: {text}")
-        logging.info(f"Phonemes: {phonemes}")
-        return phoneme_ids
+        return ids
