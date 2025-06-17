@@ -1,70 +1,25 @@
-import json
+import re
+import io
+import time
+import wave
+
+import logging
 import numpy as np
 import onnxruntime
-import wave
-import time
-import re
-import logging
-import io
-import wave
+from pydub import AudioSegment
+from deepmultilingualpunctuation import PunctuationModel
+
+from .g2p import convert
+
+
 sess_options = onnxruntime.SessionOptions()
 sess_options.enable_cpu_mem_arena = False
 sess_options.enable_mem_pattern = False
 sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 
-import io
-import wave
-import numpy as np
-from .g2p import convert
-
-from deepmultilingualpunctuation import PunctuationModel
 
 punct_model = PunctuationModel()
 
-import re
-
-# def flexible_text_split(text, max_chunk_len=100):
-#     """
-#     Гибко разбивает текст на фрагменты:
-#     1) Сначала на предложения по знакам [.?!]
-#     2) Если предложение длиннее max_chunk_len, режет его по словам на более мелкие части
-#     """
-
-#     # 1) Разбиваем на предложения с сохранением знаков
-#     pattern = r'([^.!?]*[.!?]+)'
-#     sentences = re.findall(pattern, text, flags=re.DOTALL)
-
-#     # Остаток после предложений
-#     remainder = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-#     if remainder:
-#         sentences.append(remainder)
-
-#     sentences = [s.strip() for s in sentences if s.strip()]
-
-#     # 2) Разбиваем длинные предложения на подфрагменты
-#     chunks = []
-#     for sentence in sentences:
-#         if len(sentence) <= max_chunk_len:
-#             chunks.append(sentence)
-#         else:
-#             # Разбиваем по пробелам
-#             words = sentence.split()
-#             current_chunk = ""
-#             for word in words:
-#                 # Если добавление слова превышает лимит, сохраняем текущий и начинаем новый
-#                 if len(current_chunk) + len(word) + 1 > max_chunk_len:
-#                     chunks.append(current_chunk.strip())
-#                     current_chunk = word
-#                 else:
-#                     current_chunk += " " + word
-#             if current_chunk:
-#                 chunks.append(current_chunk.strip())
-
-#     return chunks
-
-
-from pydub import AudioSegment
-import numpy as np
 
 def load_breath(path='breath.wav') -> np.ndarray:
     audio = AudioSegment.from_file(path)
@@ -180,6 +135,7 @@ class Synth:
         logging.info("Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)" % (real_time_factor, infer_sec, audio_duration_sec))
         return audio
 
+
     def synth(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
         audio = self.synth_audio(text, speaker_id, noise_level, speech_rate, duration_noise_level, scale)
 
@@ -195,26 +151,24 @@ class Synth:
 
     def fast_synth_streaming_bytes(synth_obj, text, breath_path='breath.wav', **kwargs) -> bytes:
         chunks = flexible_text_split(text)
-        print(chunks)
         breath_audio = load_breath(breath_path)
-        print(breath_audio)
         audio_chunks = []
-        print(audio_chunks)
 
         for i, chunk in enumerate(chunks):
             chunk = chunk.strip()
-            print(f"Chunks: {chunk}")
-
             if not chunk:
                 continue
+            try:
+                audio = synth_obj.synth_audio(chunk, **kwargs)
+                audio_chunks.append(audio)
+                # Добавляем дыхание между кусками, кроме последнего
+                if i < len(chunks) - 1:
+                    audio_chunks.append(breath_audio)
+            except Exception as e:
+                print(f"Ошибка при синтезе '{chunk}': {e}")
 
-            audio = synth_obj.synth_audio(chunk, **kwargs)
-            print(audio)
-            audio_chunks.append(audio)
-            # Добавляем дыхание между кусками, кроме последнего
-            if i < len(chunks) - 1:
-                audio_chunks.append(breath_audio)
-
+        if not audio_chunks:
+            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
 
         final_audio = np.concatenate(audio_chunks)
 
@@ -227,6 +181,7 @@ class Synth:
 
         return buffer.getvalue()
 
+
     def punctuate_text(self, text: str) -> str:
         keep_only_russian = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?;:\-—()]', '', text)
 
@@ -237,7 +192,6 @@ class Synth:
         print(result)
 
         return result
-
 
     def g2p(self, text, _):
         punctuated_text = self.punctuate_text(text)
@@ -281,6 +235,7 @@ class Synth:
         logging.info(f"Text: {punctuated_text}")
         logging.info(f"Phonemes: {phonemes}")
         return phoneme_ids, phone_embeddings_is
+
 
 
     def g2p_noblank(self, text, embeddings):
