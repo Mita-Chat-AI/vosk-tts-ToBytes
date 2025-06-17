@@ -23,44 +23,64 @@ punct_model = PunctuationModel()
 
 import re
 
-def flexible_text_split(text, max_chunk_len=100):
-    """
-    Гибко разбивает текст на фрагменты:
-    1) Сначала на предложения по знакам [.?!]
-    2) Если предложение длиннее max_chunk_len, режет его по словам на более мелкие части
-    """
+# def flexible_text_split(text, max_chunk_len=100):
+#     """
+#     Гибко разбивает текст на фрагменты:
+#     1) Сначала на предложения по знакам [.?!]
+#     2) Если предложение длиннее max_chunk_len, режет его по словам на более мелкие части
+#     """
 
-    # 1) Разбиваем на предложения с сохранением знаков
-    pattern = r'([^.!?]*[.!?]+)'
+#     # 1) Разбиваем на предложения с сохранением знаков
+#     pattern = r'([^.!?]*[.!?]+)'
+#     sentences = re.findall(pattern, text, flags=re.DOTALL)
+
+#     # Остаток после предложений
+#     remainder = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+#     if remainder:
+#         sentences.append(remainder)
+
+#     sentences = [s.strip() for s in sentences if s.strip()]
+
+#     # 2) Разбиваем длинные предложения на подфрагменты
+#     chunks = []
+#     for sentence in sentences:
+#         if len(sentence) <= max_chunk_len:
+#             chunks.append(sentence)
+#         else:
+#             # Разбиваем по пробелам
+#             words = sentence.split()
+#             current_chunk = ""
+#             for word in words:
+#                 # Если добавление слова превышает лимит, сохраняем текущий и начинаем новый
+#                 if len(current_chunk) + len(word) + 1 > max_chunk_len:
+#                     chunks.append(current_chunk.strip())
+#                     current_chunk = word
+#                 else:
+#                     current_chunk += " " + word
+#             if current_chunk:
+#                 chunks.append(current_chunk.strip())
+
+#     return chunks
+
+
+from pydub import AudioSegment
+import numpy as np
+
+def load_breath(path='breath.wav') -> np.ndarray:
+    audio = AudioSegment.from_file(path)
+    audio = audio.set_channels(1).set_frame_rate(22050).set_sample_width(2)  # 16-bit PCM
+    samples = np.array(audio.get_array_of_samples(), dtype=np.int16)
+    return samples
+
+
+def flexible_text_split(text):
+    pattern = r'(.*?[.,!?])'
     sentences = re.findall(pattern, text, flags=re.DOTALL)
+    
+    if not sentences:
+        return [text.strip()] if text.strip() else []
 
-    # Остаток после предложений
-    remainder = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-    if remainder:
-        sentences.append(remainder)
-
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    # 2) Разбиваем длинные предложения на подфрагменты
-    chunks = []
-    for sentence in sentences:
-        if len(sentence) <= max_chunk_len:
-            chunks.append(sentence)
-        else:
-            # Разбиваем по пробелам
-            words = sentence.split()
-            current_chunk = ""
-            for word in words:
-                # Если добавление слова превышает лимит, сохраняем текущий и начинаем новый
-                if len(current_chunk) + len(word) + 1 > max_chunk_len:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = word
-                else:
-                    current_chunk += " " + word
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-
-    return chunks
+    return [s.strip() for s in sentences if s.strip()]
 
 
 class Synth:
@@ -97,8 +117,6 @@ class Synth:
         return bert
 
     def synth_audio(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
-        print(f"TOKENIZER: {self.model.tokenizer}")
-
 
         if noise_level is None:
             noise_level = self.model.config["inference"].get("noise_level", 0.8)
@@ -113,7 +131,7 @@ class Synth:
 
         if self.model.tokenizer != None and self.model.config.get("no_blank", 0) == 0:
             bert = self.get_word_bert(text)
-            phoneme_ids, bert_embs = self.g2p(text, bert)
+            phoneme_ids, bert_embs = self.g2p(text, None)
             bert_embs = np.expand_dims(np.transpose(np.array(bert_embs, dtype=np.float32)), 0)
         elif self.model.tokenizer != None and self.model.config.get("no_blank", 0) != 0:
             bert = self.get_word_bert(text)
@@ -137,9 +155,10 @@ class Synth:
                 "input": text,
                 "input_lengths": text_lengths,
                 "scales": scales,
-                "sid": sid,  # ✅ ОСТАВИТЬ!
+                "sid": sid,
         }
-
+        if self.model.tokenizer != None:
+            args["bert"] = bert_embs
 
         start_time = time.perf_counter()
         audio = self.model.onnx.run(
@@ -160,143 +179,76 @@ class Synth:
 
         logging.info("Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)" % (real_time_factor, infer_sec, audio_duration_sec))
         return audio
-    
 
-    def safe_synth_audio(self, text, *args, **kwargs):
-        """
-        Разбивает длинный текст на предложения и синтезирует каждое отдельно, 
-        чтобы не перегружать VRAM. Затем объединяет аудио.
-        """
-        # Разбиваем на предложения по знакам препинания
-        segments = re.split(r'(?<=[.!?])\s+', text.strip())
-
-        audio_chunks = []
-        for segment in segments:
-            segment = segment.strip()
-            if not segment:
-                continue
-            try:
-                audio = self.synth_audio(segment, *args, **kwargs)
-                audio_chunks.append(audio)
-            except Exception as e:
-                logging.warning(f"Ошибка при синтезе сегмента '{segment}': {e}")
-
-        if not audio_chunks:
-            raise RuntimeError("Не удалось сгенерировать аудио ни для одного сегмента.")
-
-        return np.concatenate(audio_chunks)
-
-
-    def synth(self, text, oname, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
-
-        audio = self.safe_synth_audio(text, speaker_id, noise_level, speech_rate, duration_noise_level, scale)
-
-        with wave.open(oname, "w") as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(22050)
-            f.writeframes(audio.tobytes())
-
-
-    def synth_bytes(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
-        """Синтезирует речь и возвращает результат в виде байтового WAV-потока"""
+    def synth(self, text, speaker_id=0, noise_level=None, speech_rate=None, duration_noise_level=None, scale=None):
         audio = self.synth_audio(text, speaker_id, noise_level, speech_rate, duration_noise_level, scale)
 
         buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(22050)
-            f.writeframes(audio.tobytes())
-        buffer.seek(0)
-        return buffer.read()
-    
-
-
- 
-
-
-    
-
-    def synth_streaming_bytes(synth_obj, text, chunk_size=50, **kwargs) -> bytes:
-        """
-        Синтезирует речь кусками по chunk_size символов,
-        возвращает весь результат в виде WAV-байтов.
-        """
-        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-
-        audio_chunks = []
-        for chunk in chunks:
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            try:
-                audio_bytes = synth_obj.synth_bytes(chunk, **kwargs)  # возвращает WAV bytes для куска
-                # Нужно из WAV bytes вырезать заголовок и взять только raw audio data
-                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    audio_chunks.append(frames)
-            except Exception as e:
-                print(f"Ошибка при синтезе фрагмента '{chunk}': {e}")
-
-        if not audio_chunks:
-            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
-
-        # Объединяем аудио фреймы
-        combined_frames = b"".join(audio_chunks)
-
-        # Создаем итоговый WAV в памяти с правильным заголовком
-        buffer = io.BytesIO()
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit audio = 2 bytes per sample
+            wf.setsampwidth(2)  # 2 байта для int16
             wf.setframerate(22050)
-            wf.writeframes(combined_frames)
+            wf.writeframes(audio.astype(np.int16).tobytes())  # <-- запись звука
 
         return buffer.getvalue()
 
 
-    def synth_streaming_flexible(synth_obj, text, max_chunk_len=100, **kwargs) -> bytes:
-        chunks = flexible_text_split(text, max_chunk_len=max_chunk_len)
+    
+    def fast_synth_streaming_bytes(synth_obj, text, pause_duration=0.4, breath_path='breath.wav', **kwargs) -> bytes:
+        chunks = flexible_text_split(text)
+        print(chunks)
+        breath_audio = load_breath(breath_path)
+        print(breath_audio)
         audio_chunks = []
+        print(audio_chunks)
 
-        for chunk in chunks:
-            try:
-                audio_bytes = synth_obj.synth_bytes(chunk, **kwargs)
-                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    audio_chunks.append(frames)
-            except Exception as e:
-                print(f"Ошибка при синтезе '{chunk}': {e}")
+        for i, chunk in enumerate(chunks):
+            chunk = chunk.strip()
+            print(f"Chunks: {chunk}")
 
-        if not audio_chunks:
-            raise RuntimeError("Не удалось сгенерировать аудио ни для одного фрагмента.")
+            if not chunk:
+                continue
 
-        combined_frames = b"".join(audio_chunks)
+            audio = synth_obj.synth_audio(chunk, **kwargs)
+            print(audio)
+            audio_chunks.append(audio)
+            # Добавляем дыхание между кусками, кроме последнего
+            if i < len(chunks) - 1:
+                audio_chunks.append(breath_audio)
+
+
+        final_audio = np.concatenate(audio_chunks)
+
         buffer = io.BytesIO()
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(22050)
-            wf.writeframes(combined_frames)
+            wf.writeframes(final_audio.tobytes())
 
         return buffer.getvalue()
 
     def punctuate_text(self, text: str) -> str:
         keep_only_russian = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?;:\-—()]', '', text)
 
-        text = re.sub(r'[,.!?;:…]', '', keep_only_russian)  # удаляем старую пунктуацию
+        text = re.sub(r'[,.!?;:…]', '', keep_only_russian)
 
-        return punct_model.restore_punctuation(text)
+        print(text)
+        result =punct_model.restore_punctuation(text)
+        print(result)
 
-    def g2p(self, text, embeddings):
-        punctuate_text = self.punctuate_text(text)
-        print(punctuate_text)
+        return result
+
+    def g2p(self, text, _):
+        punctuated_text = self.punctuate_text(text)
+        embeddings = self.get_word_bert(punctuated_text)
+
         pattern = "([,.?!;:\"() ])"
         phonemes = ["^"]
         phone_embeddings = [embeddings[0]]
         word_index = 1
-        for word in re.split(pattern, punctuate_text.lower()):
+
+        for word in re.split(pattern, punctuated_text.lower()):
             if word == "":
                 continue
             if re.match(pattern, word) or word == '-':
@@ -311,7 +263,8 @@ class Synth:
                     phonemes.append(p)
                     phone_embeddings.append(embeddings[word_index])
             if word != " ":
-                word_index = word_index + 1
+                word_index += 1
+
         phonemes.append("$")
         phone_embeddings.append(embeddings[-1])
 
@@ -325,9 +278,11 @@ class Synth:
             phone_embeddings_is.append(phone_embeddings[i])
             phone_embeddings_is.append(phone_embeddings[i])
 
-        logging.info(f"Text: {text}")
+        logging.info(f"Text: {punctuated_text}")
         logging.info(f"Phonemes: {phonemes}")
         return phoneme_ids, phone_embeddings_is
+
+
 
     def g2p_noblank(self, text, embeddings):
         pattern = "([,.?!;:\"() ])"
