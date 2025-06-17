@@ -193,8 +193,7 @@ class Synth:
         return buffer.getvalue()
 
 
-    
-    def fast_synth_streaming_bytes(synth_obj, text, pause_duration=0.4, breath_path='breath.wav', **kwargs) -> bytes:
+    def fast_synth_streaming_bytes(synth_obj, text, breath_path='breath.wav', **kwargs) -> bytes:
         chunks = flexible_text_split(text)
         print(chunks)
         breath_audio = load_breath(breath_path)
@@ -239,6 +238,7 @@ class Synth:
 
         return result
 
+
     def g2p(self, text, _):
         punctuated_text = self.punctuate_text(text)
         embeddings = self.get_word_bert(punctuated_text)
@@ -281,7 +281,6 @@ class Synth:
         logging.info(f"Text: {punctuated_text}")
         logging.info(f"Phonemes: {phonemes}")
         return phoneme_ids, phone_embeddings_is
-
 
 
     def g2p_noblank(self, text, embeddings):
